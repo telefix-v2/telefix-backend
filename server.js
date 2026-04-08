@@ -6,89 +6,57 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ── Security: strict CORS ──────────────────────────────────────
-// Change this to your actual Expo tunnel domain or leave * for dev
 app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: "20kb" })); // Limit request body size
+app.use(express.json({ limit: "50mb" })); // Large limit for PDFs and images
 
-// ── Simple in-memory rate limiter ─────────────────────────────
+// ── Rate limiter ───────────────────────────────────────────────
 const rateLimitMap = new Map();
-const RATE_LIMIT = 30;        // max requests
-const RATE_WINDOW = 60 * 1000; // per 60 seconds
+const aiRateLimitMap = new Map();
+const RATE_WINDOW = 60 * 1000;
 
 function rateLimit(req, res, next) {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
   const now = Date.now();
   const entry = rateLimitMap.get(ip) || { count: 0, start: now };
-
-  if (now - entry.start > RATE_WINDOW) {
-    entry.count = 1;
-    entry.start = now;
-  } else {
-    entry.count += 1;
-  }
-
+  if (now - entry.start > RATE_WINDOW) { entry.count = 1; entry.start = now; }
+  else entry.count += 1;
   rateLimitMap.set(ip, entry);
-
-  if (entry.count > RATE_LIMIT) {
-    return res.status(429).json({ error: "Too many requests. Slow down." });
-  }
+  if (entry.count > 60) return res.status(429).json({ error: "Too many requests." });
   next();
 }
-
-// ── Stricter rate limit for AI endpoint ───────────────────────
-const aiRateLimitMap = new Map();
-const AI_RATE_LIMIT = 10; // max 10 AI calls per minute per IP
 
 function aiRateLimit(req, res, next) {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
   const now = Date.now();
   const entry = aiRateLimitMap.get(ip) || { count: 0, start: now };
-
-  if (now - entry.start > RATE_WINDOW) {
-    entry.count = 1;
-    entry.start = now;
-  } else {
-    entry.count += 1;
-  }
-
+  if (now - entry.start > RATE_WINDOW) { entry.count = 1; entry.start = now; }
+  else entry.count += 1;
   aiRateLimitMap.set(ip, entry);
-
-  if (entry.count > AI_RATE_LIMIT) {
-    return res.status(429).json({ error: "AI rate limit reached. Wait 1 minute." });
-  }
+  if (entry.count > 15) return res.status(429).json({ error: "AI rate limit reached. Wait 1 minute." });
   next();
 }
 
 app.use(rateLimit);
 
-// ── Health check ──────────────────────────────────────────────
+// ── Health ─────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    ai: ANTHROPIC_KEY ? "configured" : "missing",
-  });
+  res.json({ status: "ok", timestamp: new Date().toISOString(), ai: ANTHROPIC_KEY ? "configured" : "missing" });
 });
 
-// ── Tickets ───────────────────────────────────────────────────
+// ── Tickets ────────────────────────────────────────────────────
 let tickets = [];
 
-app.get("/tickets", (req, res) => {
-  res.json(tickets);
-});
+app.get("/tickets", (req, res) => res.json(tickets));
 
 app.get("/tickets/:id", (req, res) => {
   const ticket = tickets.find((t) => t.id === req.params.id);
-  if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+  if (!ticket) return res.status(404).json({ error: "Not found" });
   res.json(ticket);
 });
 
 app.post("/tickets", (req, res) => {
   const { title, description, priority, status, carrier } = req.body;
-  if (!title || typeof title !== "string" || title.trim().length === 0) {
-    return res.status(400).json({ error: "Title is required" });
-  }
+  if (!title?.trim()) return res.status(400).json({ error: "Title required" });
   const ticket = {
     id: uuidv4(),
     title: title.trim().slice(0, 200),
@@ -105,25 +73,22 @@ app.post("/tickets", (req, res) => {
 
 app.patch("/tickets/:id", (req, res) => {
   const index = tickets.findIndex((t) => t.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Ticket not found" });
+  if (index === -1) return res.status(404).json({ error: "Not found" });
   const allowed = ["status", "priority", "title", "description", "carrier"];
   const updates = {};
-  for (const key of allowed) {
-    if (req.body[key] !== undefined) updates[key] = req.body[key];
-  }
+  for (const key of allowed) if (req.body[key] !== undefined) updates[key] = req.body[key];
   tickets[index] = { ...tickets[index], ...updates, updated_at: new Date().toISOString() };
   res.json(tickets[index]);
 });
 
 app.delete("/tickets/:id", (req, res) => {
   const index = tickets.findIndex((t) => t.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Ticket not found" });
+  if (index === -1) return res.status(404).json({ error: "Not found" });
   tickets.splice(index, 1);
   res.json({ deleted: true });
 });
 
-// ── AI Proxy ──────────────────────────────────────────────────
-// The app sends messages here — the key never leaves the server
+// ── AI System Prompt ───────────────────────────────────────────
 const SYSTEM_PROMPT = `You are TeleFix AI, an expert telecommunications field operations assistant with deep knowledge of Verizon, AT&T, and T-Mobile networks, hardware, alarm systems, and troubleshooting procedures.
 
 ## YOUR EXPERTISE COVERS:
@@ -149,7 +114,7 @@ const SYSTEM_PROMPT = `You are TeleFix AI, an expert telecommunications field op
 - Systems: TNET, PRISM, WFMS, ServiceNow TMUS
 - Technologies: Band 71 (600MHz), Band 41 (2.5GHz) massive MIMO, 5G SA/NSA, CBRS
 
-### UNIVERSAL TELECOM ALARMS:
+### UNIVERSAL TELECOM:
 - LOS, LOF, AIS, BER, OSNR, RSL, TX/RX power alarms
 - Cell outages: RF, baseband, transport, power
 - Power: rectifier, battery, generator, AC/DC
@@ -160,32 +125,87 @@ const SYSTEM_PROMPT = `You are TeleFix AI, an expert telecommunications field op
 - Fiber: OTDR events, connector loss, splice, cable cut
 - DWDM: amplifier, mux/demux, wavelength drift
 
-## HOW YOU WORK:
-1. Immediately identify carrier, alarm severity, and category
-2. Ask max 3 targeted diagnostic questions (one at a time)
-3. Provide numbered step-by-step resolution with CLI commands, expected results, and escalation path
+## WHEN ANALYZING FILES OR IMAGES:
+- For PDF reports: extract all alarm codes, readings, and anomalies. Provide specific fixes.
+- For OTDR traces: identify event locations, loss values, reflections, and fiber faults.
+- For site photos: identify equipment type, alarm LED states, physical damage, installation issues.
+- For spreadsheets/CSVs: identify out-of-range values, patterns, and problem areas.
+- Always provide numbered step-by-step resolution procedures.
 
 Be direct and technical. Use proper telecom terminology. Flag safety hazards when relevant.`;
 
+// ── AI Proxy — handles text, images, AND PDFs ──────────────────
 app.post("/ai/troubleshoot", aiRateLimit, async (req, res) => {
-  if (!ANTHROPIC_KEY) {
-    return res.status(503).json({ error: "AI not configured on server." });
-  }
+  if (!ANTHROPIC_KEY) return res.status(503).json({ error: "AI not configured." });
 
   const { messages } = req.body;
 
-  // Validate messages
   if (!Array.isArray(messages) || messages.length === 0 || messages.length > 50) {
     return res.status(400).json({ error: "Invalid messages." });
   }
 
+  // Build Claude-compatible messages — supports text, images, and PDFs
+  const claudeMessages = [];
+
   for (const msg of messages) {
-    if (!["user", "assistant"].includes(msg.role) || typeof msg.content !== "string") {
-      return res.status(400).json({ error: "Invalid message format." });
+    if (!["user", "assistant"].includes(msg.role)) continue;
+
+    // If content is a string — plain text message
+    if (typeof msg.content === "string") {
+      if (msg.content.length > 10000) {
+        return res.status(400).json({ error: "Message too long." });
+      }
+      claudeMessages.push({ role: msg.role, content: msg.content });
+      continue;
     }
-    if (msg.content.length > 4000) {
-      return res.status(400).json({ error: "Message too long." });
+
+    // If content is an array — could contain images, PDFs, text blocks
+    if (Array.isArray(msg.content)) {
+      const contentBlocks = [];
+
+      for (const block of msg.content) {
+        // Text block
+        if (block.type === "text") {
+          contentBlocks.push({ type: "text", text: block.text ?? "" });
+          continue;
+        }
+
+        // Image block (from camera or gallery)
+        if (block.type === "image" && block.source?.data) {
+          contentBlocks.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: block.source.media_type ?? "image/jpeg",
+              data: block.source.data,
+            },
+          });
+          continue;
+        }
+
+        // PDF document block
+        if (block.type === "document" && block.source?.data) {
+          contentBlocks.push({
+            type: "document",
+            source: {
+              type: "base64",
+              media_type: "application/pdf",
+              data: block.source.data,
+            },
+          });
+          continue;
+        }
+      }
+
+      if (contentBlocks.length > 0) {
+        claudeMessages.push({ role: msg.role, content: contentBlocks });
+      }
+      continue;
     }
+  }
+
+  if (claudeMessages.length === 0) {
+    return res.status(400).json({ error: "No valid messages." });
   }
 
   try {
@@ -195,12 +215,13 @@ app.post("/ai/troubleshoot", aiRateLimit, async (req, res) => {
         "Content-Type": "application/json",
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "pdfs-2024-09-25",
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1024,
+        max_tokens: 2048,
         system: SYSTEM_PROMPT,
-        messages,
+        messages: claudeMessages,
       }),
     });
 
@@ -218,10 +239,8 @@ app.post("/ai/troubleshoot", aiRateLimit, async (req, res) => {
   }
 });
 
-// ── 404 fallback ──────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
-});
+// ── 404 ────────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: "Route not found" }));
 
 app.listen(PORT, () => {
   console.log(`TeleFix backend running on port ${PORT}`);
